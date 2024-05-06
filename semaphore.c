@@ -8,6 +8,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <sys/msg.h>    // メッセージキュー操作のためのヘッダー
+#include <sys/sem.h>
 #include <string.h>     // strstr関数のためのヘッダー
 #include <errno.h>      // エラー番号定義のためのヘッダー
 
@@ -16,6 +17,14 @@ struct message {
     long msg_type;
     char msg_text[100];
 };
+
+// #if !defined(_SEM_SEMUN_UNDEFINED)
+// union semun {
+//     int val;
+//     struct semid_ds *buf;
+//     unsigned short *array;
+// };
+// #endif
 
 // シグナルハンドラの定義
 void signalHandler(int signum) {
@@ -26,6 +35,47 @@ void secondChildHandler(int signum) {
     printf("secondChild: Signal %d received, now starting to read from FIFO.\n", signum);
 }
 
+int init_semaphore() {
+    int semid = semget(IPC_PRIVATE, 1, 0666 | IPC_CREAT);
+    if (semid == -1) {
+        perror("semget failed");
+        exit(EXIT_FAILURE);
+    }
+    union semun arg;
+    arg.val = 1; // セマフォの初期値 (1は一度に1つのプロセスのみ許可)
+    if (semctl(semid, 0, SETVAL, arg) == -1) {
+        perror("semctl failed");
+        exit(EXIT_FAILURE);
+    }
+    return semid;
+}
+
+void P(int semid) {
+    struct sembuf sop = {0, -1, 0};  // P操作
+    if (semop(semid, &sop, 1) == -1) {
+        perror("P operation failed");
+        exit(EXIT_FAILURE);
+    }
+}
+
+void V(int semid) {
+    struct sembuf sop = {0, 1, 0};  // V操作
+    if (semop(semid, &sop, 1) == -1) {
+        perror("V operation failed");
+        exit(EXIT_FAILURE);
+    }
+}
+
+void write_log(const char *filename, const char *entry) {
+    FILE *file = fopen(filename, "a");
+    if (file == NULL) {
+        perror("Failed to open log file");
+        exit(EXIT_FAILURE);
+    }
+    fprintf(file, "%s\n", entry);
+    fclose(file);
+}
+
 int main(int argc, char *argv[]) {
     // コマンドライン引数の確認
     if (argc != 2) {
@@ -34,6 +84,9 @@ int main(int argc, char *argv[]) {
     }
 
     int number_of_voters = atoi(argv[1]);  // 選挙人数の読み取り
+    int semid = init_semaphore();
+    char *log_file = "./leave_log.txt";
+
     int pipefd[2], fd;  // パイプとファイルディスクリプタの定義
     pid_t firstChild, secondChild;  // 子プロセスのPID
     int buffer;  // 識別番号を格納するバッファ
@@ -47,8 +100,21 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
+    // FIFOファイルの生成前に既存のファイルを確認し、存在する場合は削除
+    struct stat st;
+    if (stat(fifo, &st) == 0) {
+        // ファイルが存在する場合、削除を試みる
+        if (unlink(fifo) == -1) {
+            perror("Failed to remove existing fifo");
+            exit(EXIT_FAILURE);
+        }
+    }
+
     // FIFOの生成
-    mkfifo(fifo, 0666);
+    if (mkfifo(fifo, 0666) == -1) {
+        perror("mkfifo");
+        exit(EXIT_FAILURE);
+    }
 
     // シグナルハンドラの設定
     signal(SIGUSR1, signalHandler);
@@ -150,6 +216,24 @@ int main(int argc, char *argv[]) {
         }
 
         msgctl(msgid, IPC_RMID, NULL);
+
+        // 親プロセスが子プロセスを起動した後、一人のメンバーが部屋を離れるシミュレーション
+        P(semid);  // セマフォを取得し、部屋を離れる
+        char time_buffer[100];
+        time_t now = time(NULL);
+        strftime(time_buffer, 100, "%Y-%m-%d %H:%M:%S", localtime(&now));
+        write_log(log_file, "Member leaves the room at: ");
+        write_log(log_file, time_buffer);
+
+        sleep(5);  // 外にいることをシミュレート
+
+        now = time(NULL);
+        strftime(time_buffer, 100, "%Y-%m-%d %H:%M:%S", localtime(&now));
+        write_log(log_file, "Member returns to the room at: ");
+        write_log(log_file, time_buffer);
+        V(semid);  // セマフォを解放し、部屋に戻る
+
+        printf("Operation logged in %s\n", log_file);
         printf("Parent process ended.\n");
         exit(0);
     }
